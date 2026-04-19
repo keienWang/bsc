@@ -46,12 +46,6 @@ type txMonitorLogEntry struct {
 	ValueWei   string `json:"value_wei"`
 }
 
-func logRawTransactions(source string, txs []*types.Transaction) {
-	for _, tx := range txs {
-		logTransactionMonitor("raw", source, tx)
-	}
-}
-
 func logAcceptedTransactions(source string, txs []*types.Transaction, errs []error) {
 	for i, tx := range txs {
 		if i < len(errs) && errs[i] != nil {

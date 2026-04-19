@@ -338,7 +338,6 @@ func (b *EthAPIBackend) SubscribeLogsEvent(ch chan<- []*types.Log) event.Subscri
 }
 
 func (b *EthAPIBackend) SendTx(ctx context.Context, signedTx *types.Transaction) error {
-	logTransactionMonitor("raw", "rpc", signedTx)
 	err := b.eth.txPool.Add([]*types.Transaction{signedTx}, false)[0]
 	if err == nil {
 		logAcceptedTransaction("rpc", signedTx)
