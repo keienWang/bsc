@@ -18,7 +18,6 @@ package fetcher
 
 import (
 	"errors"
-	"fmt"
 	"math"
 	mrand "math/rand"
 	"sort"
@@ -424,6 +423,19 @@ func clonePeerSet(peers map[string]struct{}) map[string]struct{} {
 	return cloned
 }
 
+func mergePeerSet(dst map[string]struct{}, src map[string]struct{}) map[string]struct{} {
+	if len(src) == 0 {
+		return dst
+	}
+	if dst == nil {
+		dst = make(map[string]struct{}, len(src))
+	}
+	for peer := range src {
+		dst[peer] = struct{}{}
+	}
+	return dst
+}
+
 func (f *TxFetcher) addFetching(hash common.Hash, peer string) bool {
 	peers := f.fetching[hash]
 	if peers == nil {
@@ -677,11 +689,8 @@ func (f *TxFetcher) loop() {
 							}
 						}
 						// Move the delivery back from fetching to queued
-						if _, ok := f.announced[hash]; ok {
-							panic("announced tracker already contains alternate item")
-						}
 						if f.alternates[hash] != nil { // nil if tx was broadcast during fetch
-							f.announced[hash] = f.alternates[hash]
+							f.announced[hash] = mergePeerSet(f.announced[hash], f.alternates[hash])
 						}
 						delete(f.announced[hash], peer)
 						if len(f.announced[hash]) == 0 {
@@ -841,10 +850,7 @@ func (f *TxFetcher) loop() {
 							}
 						}
 						if len(f.alternates[hash]) > 0 {
-							if _, ok := f.announced[hash]; ok {
-								panic(fmt.Sprintf("announced tracker already contains alternate item: %v", f.announced[hash]))
-							}
-							f.announced[hash] = f.alternates[hash]
+							f.announced[hash] = mergePeerSet(f.announced[hash], f.alternates[hash])
 						}
 					}
 					delete(f.alternates, hash)
