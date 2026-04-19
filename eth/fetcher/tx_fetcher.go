@@ -72,6 +72,10 @@ const (
 
 	// addTxsBatchSize it the max number of transactions to add in a single batch from a peer.
 	addTxsBatchSize = 128
+
+	// maxTxFetchPeersPerHash bounds the amount of duplicate transaction retrieval
+	// fanout we allow for the same hash across multiple peers.
+	maxTxFetchPeersPerHash = 2
 )
 
 var (
@@ -127,6 +131,13 @@ type txDrop struct {
 	peer string
 }
 
+// txPromote requests a set of announced transactions to bypass the arrival
+// wait window and be scheduled for retrieval immediately.
+type txPromote struct {
+	peer   string
+	hashes []common.Hash
+}
+
 // TxFetcher is responsible for retrieving new transaction based on announcements.
 //
 // The fetcher operates in 3 stages:
@@ -142,12 +153,13 @@ type txDrop struct {
 //     three stages. This ensures that the fetcher operates akin to a finite
 //     state automata and there's no data leak.
 //   - Each peer that announced transactions may be scheduled retrievals, but
-//     only ever one concurrently. This ensures we can immediately know what is
-//     missing from a reply and reschedule it.
+//     only ever one batch concurrently. Individual hashes may be fanned out to
+//     a small number of peers to reduce tail latency.
 type TxFetcher struct {
 	notify  chan *txAnnounce
 	cleanup chan *txDelivery
 	drop    chan *txDrop
+	promote chan *txPromote
 	quit    chan struct{}
 
 	txSeq       uint64                             // Unique transaction sequence number
@@ -167,9 +179,10 @@ type TxFetcher struct {
 	// Stage 3: Set of transactions currently being retrieved, some which may be
 	// fulfilled and some rescheduled. Note, this step shares 'announces' from the
 	// previous stage to avoid having to duplicate (need it for DoS checks).
-	fetching   map[common.Hash]string              // Transaction set currently being retrieved
+	fetching   map[common.Hash]map[string]struct{} // Transaction set currently being retrieved
 	requests   map[string]*txRequest               // In-flight transaction retrievals
 	alternates map[common.Hash]map[string]struct{} // In-flight transaction alternate origins if retrieval fails
+	expedite   map[common.Hash]struct{}            // Transaction hashes allowed to fan out across peers
 
 	// Callbacks
 	hasTx    func(common.Hash) bool                     // Retrieves a tx from the local txpool
@@ -198,15 +211,17 @@ func NewTxFetcherForTests(
 		notify:      make(chan *txAnnounce),
 		cleanup:     make(chan *txDelivery),
 		drop:        make(chan *txDrop),
+		promote:     make(chan *txPromote),
 		quit:        make(chan struct{}),
 		waitlist:    make(map[common.Hash]map[string]struct{}),
 		waittime:    make(map[common.Hash]mclock.AbsTime),
 		waitslots:   make(map[string]map[common.Hash]*txMetadataWithSeq),
 		announces:   make(map[string]map[common.Hash]*txMetadataWithSeq),
 		announced:   make(map[common.Hash]map[string]struct{}),
-		fetching:    make(map[common.Hash]string),
+		fetching:    make(map[common.Hash]map[string]struct{}),
 		requests:    make(map[string]*txRequest),
 		alternates:  make(map[common.Hash]map[string]struct{}),
+		expedite:    make(map[common.Hash]struct{}),
 		underpriced: lru.NewCache[common.Hash, time.Time](maxTxUnderpricedSetSize),
 		hasTx:       hasTx,
 		addTxs:      addTxs,
@@ -385,6 +400,64 @@ func (f *TxFetcher) Drop(peer string) error {
 	case <-f.quit:
 		return errTerminated
 	}
+}
+
+// Promote bypasses the announcement arrival wait window for the given hashes
+// and schedules them for retrieval immediately when possible.
+func (f *TxFetcher) Promote(peer string, hashes []common.Hash) error {
+	select {
+	case f.promote <- &txPromote{peer: peer, hashes: hashes}:
+		return nil
+	case <-f.quit:
+		return errTerminated
+	}
+}
+
+func clonePeerSet(peers map[string]struct{}) map[string]struct{} {
+	if len(peers) == 0 {
+		return nil
+	}
+	cloned := make(map[string]struct{}, len(peers))
+	for peer := range peers {
+		cloned[peer] = struct{}{}
+	}
+	return cloned
+}
+
+func (f *TxFetcher) addFetching(hash common.Hash, peer string) bool {
+	peers := f.fetching[hash]
+	if peers == nil {
+		peers = make(map[string]struct{}, maxTxFetchPeersPerHash)
+		f.fetching[hash] = peers
+	}
+	if _, ok := peers[peer]; ok {
+		return false
+	}
+	if len(peers) == 0 {
+		peers[peer] = struct{}{}
+		return true
+	}
+	if _, ok := f.expedite[hash]; !ok {
+		return false
+	}
+	if len(peers) >= maxTxFetchPeersPerHash {
+		return false
+	}
+	peers[peer] = struct{}{}
+	return true
+}
+
+func (f *TxFetcher) removeFetchingPeer(hash common.Hash, peer string) int {
+	peers := f.fetching[hash]
+	if peers == nil {
+		return 0
+	}
+	delete(peers, peer)
+	if len(peers) == 0 {
+		delete(f.fetching, hash)
+		return 0
+	}
+	return len(peers)
 }
 
 // Start boots up the announcement based synchroniser, accepting and processing
@@ -615,8 +688,12 @@ func (f *TxFetcher) loop() {
 							delete(f.announced, hash)
 						}
 						delete(f.announces[peer], hash)
-						delete(f.alternates, hash)
-						delete(f.fetching, hash)
+						if f.removeFetchingPeer(hash, peer) == 0 {
+							delete(f.alternates, hash)
+							if _, ok := f.announced[hash]; !ok {
+								delete(f.expedite, hash)
+							}
+						}
 					}
 					if len(f.announces[peer]) == 0 {
 						delete(f.announces, peer)
@@ -690,19 +767,28 @@ func (f *TxFetcher) loop() {
 					}
 					delete(f.announced, hash)
 					delete(f.alternates, hash)
+					if _, ok := f.announced[hash]; !ok {
+						delete(f.expedite, hash)
+					}
 
-					// If a transaction currently being fetched from a different
-					// origin was delivered (delivery stolen), mark it so the
-					// actual delivery won't double schedule it.
-					if origin, ok := f.fetching[hash]; ok && (origin != delivery.origin || !delivery.direct) {
-						stolen := f.requests[origin].stolen
-						if stolen == nil {
-							f.requests[origin].stolen = make(map[common.Hash]struct{})
-							stolen = f.requests[origin].stolen
+					// If a transaction currently being fetched from different
+					// peers was delivered, mark those requests as stolen so they
+					// won't reschedule the hash when their replies arrive later.
+					for origin := range f.fetching[hash] {
+						if origin == delivery.origin && delivery.direct {
+							continue
 						}
-						stolen[hash] = struct{}{}
+						if req := f.requests[origin]; req != nil {
+							stolen := req.stolen
+							if stolen == nil {
+								req.stolen = make(map[common.Hash]struct{})
+								stolen = req.stolen
+							}
+							stolen[hash] = struct{}{}
+						}
 					}
 					delete(f.fetching, hash)
+					delete(f.expedite, hash)
 				}
 			}
 			// In case of a direct delivery, also reschedule anything missing
@@ -744,6 +830,9 @@ func (f *TxFetcher) loop() {
 						}
 					}
 					if _, ok := delivered[hash]; !ok {
+						if f.removeFetchingPeer(hash, delivery.origin) > 0 {
+							continue
+						}
 						if i < cutoff {
 							delete(f.alternates[hash], delivery.origin)
 							delete(f.announces[delivery.origin], hash)
@@ -759,7 +848,6 @@ func (f *TxFetcher) loop() {
 						}
 					}
 					delete(f.alternates, hash)
-					delete(f.fetching, hash)
 				}
 				// Something was delivered, try to reschedule requests
 				f.scheduleFetches(timeoutTimer, timeoutTrigger, nil) // Partial delivery may enable others to deliver too
@@ -768,6 +856,49 @@ func (f *TxFetcher) loop() {
 			if delivery.violation != nil {
 				log.Warn("Disconnect peer for protocol violation", "peer", delivery.origin, "error", delivery.violation)
 				f.dropPeer(delivery.origin)
+			}
+
+		case promotion := <-f.promote:
+			actives := make(map[string]struct{})
+			for _, hash := range promotion.hashes {
+				f.expedite[hash] = struct{}{}
+				// If the transaction is still in the waitlist, move it to the
+				// announced queue immediately for every peer that advertised it.
+				if peers := f.waitlist[hash]; peers != nil {
+					if _, ok := peers[promotion.peer]; !ok {
+						continue
+					}
+					if f.announced[hash] != nil {
+						panic("announce tracker already contains promoted waitlist item")
+					}
+					f.announced[hash] = peers
+					for peer := range peers {
+						if announces := f.announces[peer]; announces != nil {
+							announces[hash] = f.waitslots[peer][hash]
+						} else {
+							f.announces[peer] = map[common.Hash]*txMetadataWithSeq{hash: f.waitslots[peer][hash]}
+						}
+						delete(f.waitslots[peer], hash)
+						if len(f.waitslots[peer]) == 0 {
+							delete(f.waitslots, peer)
+						}
+						actives[peer] = struct{}{}
+					}
+					delete(f.waittime, hash)
+					delete(f.waitlist, hash)
+					continue
+				}
+				// If the transaction is already queued for retrieval from this peer,
+				// nudge the scheduler so it can be requested right away.
+				if announces := f.announces[promotion.peer]; announces != nil && announces[hash] != nil {
+					actives[promotion.peer] = struct{}{}
+				}
+			}
+			if len(f.waittime) > 0 {
+				f.rescheduleWait(waitTimer, waitTrigger)
+			}
+			if len(actives) > 0 {
+				f.scheduleFetches(timeoutTimer, timeoutTrigger, actives)
 			}
 
 		case drop := <-f.drop:
@@ -796,14 +927,20 @@ func (f *TxFetcher) loop() {
 						}
 					}
 					// Undelivered hash, reschedule if there's an alternative origin available
+					f.removeFetchingPeer(hash, drop.peer)
+					if _, ok := f.fetching[hash]; ok {
+						continue
+					}
 					delete(f.alternates[hash], drop.peer)
 					if len(f.alternates[hash]) == 0 {
 						delete(f.alternates, hash)
+						if _, ok := f.announced[hash]; !ok {
+							delete(f.expedite, hash)
+						}
 					} else {
 						f.announced[hash] = f.alternates[hash]
 						delete(f.alternates, hash)
 					}
-					delete(f.fetching, hash)
 				}
 				if request.hashes == nil {
 					txFetcherSlowPeers.Dec(1)
@@ -941,17 +1078,15 @@ func (f *TxFetcher) scheduleFetches(timer *mclock.Timer, timeout chan struct{}, 
 			bytes  uint64
 		)
 		f.forEachAnnounce(f.announces[peer], func(hash common.Hash, meta txMetadata) bool {
-			// If the transaction is already fetching, skip to the next one
-			if _, ok := f.fetching[hash]; ok {
+			// Skip the hash if we've already fanned out to enough peers.
+			if !f.addFetching(hash, peer) {
 				return true
 			}
-			// Mark the hash as fetching and stash away possible alternates
-			f.fetching[hash] = peer
 
-			if _, ok := f.alternates[hash]; ok {
-				panic(fmt.Sprintf("alternate tracker already contains fetching item: %v", f.alternates[hash]))
+			// Mark the hash as fetching and stash away possible alternates.
+			if _, ok := f.alternates[hash]; !ok {
+				f.alternates[hash] = clonePeerSet(f.announced[hash])
 			}
-			f.alternates[hash] = f.announced[hash]
 			delete(f.announced, hash)
 
 			// Accumulate the hash and stop if the limit was reached

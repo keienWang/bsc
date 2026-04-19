@@ -884,6 +884,7 @@ func (s *Ethereum) Start() error {
 
 	// start log indexer
 	s.filterMaps.Start()
+	go monitorConfirmedLogs(s.blockchain, s.stopCh)
 	go s.updateFilterMapsHeads()
 	return nil
 }

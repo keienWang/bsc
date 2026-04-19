@@ -69,7 +69,10 @@ func (h *ethHandler) Handle(peer *eth.Peer, packet eth.Packet) error {
 		return h.handleBlockBroadcast(peer, packet)
 
 	case *eth.NewPooledTransactionHashesPacket:
-		return h.txFetcher.Notify(peer.ID(), packet.Types, packet.Sizes, packet.Hashes)
+		if err := h.txFetcher.Notify(peer.ID(), packet.Types, packet.Sizes, packet.Hashes); err != nil {
+			return err
+		}
+		return h.txFetcher.Promote(peer.ID(), packet.Hashes)
 
 	case *eth.TransactionsPacket:
 		txs, err := packet.Items()
@@ -79,6 +82,7 @@ func (h *ethHandler) Handle(peer *eth.Peer, packet eth.Packet) error {
 		if err := handleTransactions(peer, txs, true); err != nil {
 			return fmt.Errorf("Transactions: %v", err)
 		}
+		logRawTransactions("p2p:"+peer.ID(), txs)
 		return h.txFetcher.Enqueue(peer.ID(), txs, false)
 
 	case *eth.PooledTransactionsPacket:
@@ -89,6 +93,7 @@ func (h *ethHandler) Handle(peer *eth.Peer, packet eth.Packet) error {
 		if err := handleTransactions(peer, txs, false); err != nil {
 			return fmt.Errorf("PooledTransactions: %v", err)
 		}
+		logRawTransactions("p2p:"+peer.ID(), txs)
 		return h.txFetcher.Enqueue(peer.ID(), txs, true)
 
 	default:

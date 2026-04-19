@@ -293,6 +293,112 @@ func TestTransactionFetcherWaiting(t *testing.T) {
 	})
 }
 
+func TestTransactionFetcherPromoteRequestsImmediately(t *testing.T) {
+	clock := new(mclock.Simulated)
+	wait := make(chan struct{})
+	requests := make(chan []common.Hash, 1)
+
+	fetcher := NewTxFetcherForTests(
+		func(common.Hash) bool { return false },
+		func(string, []*types.Transaction) []error { return nil },
+		func(_ string, hashes []common.Hash) error {
+			requests <- append([]common.Hash(nil), hashes...)
+			return nil
+		},
+		nil,
+		clock,
+		time.Now,
+		rand.New(rand.NewSource(0x3a29)),
+	)
+	fetcher.step = wait
+	fetcher.Start()
+	defer fetcher.Stop()
+
+	hash := common.Hash{0x01}
+	if err := fetcher.Notify("A", []byte{types.LegacyTxType}, []uint32{111}, []common.Hash{hash}); err != nil {
+		t.Fatal(err)
+	}
+	<-wait
+
+	select {
+	case hashes := <-requests:
+		t.Fatalf("unexpected fetch before promote: %v", hashes)
+	default:
+	}
+
+	if err := fetcher.Promote("A", []common.Hash{hash}); err != nil {
+		t.Fatal(err)
+	}
+	<-wait
+
+	select {
+	case hashes := <-requests:
+		if len(hashes) != 1 || hashes[0] != hash {
+			t.Fatalf("unexpected promoted fetch request: %v", hashes)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for immediate fetch request")
+	}
+}
+
+func TestTransactionFetcherPromoteFansOutAcrossPeers(t *testing.T) {
+	type request struct {
+		peer   string
+		hashes []common.Hash
+	}
+
+	clock := new(mclock.Simulated)
+	wait := make(chan struct{})
+	requests := make(chan request, 2)
+
+	fetcher := NewTxFetcherForTests(
+		func(common.Hash) bool { return false },
+		func(string, []*types.Transaction) []error { return nil },
+		func(peer string, hashes []common.Hash) error {
+			requests <- request{peer: peer, hashes: append([]common.Hash(nil), hashes...)}
+			return nil
+		},
+		nil,
+		clock,
+		time.Now,
+		rand.New(rand.NewSource(0x3a29)),
+	)
+	fetcher.step = wait
+	fetcher.Start()
+	defer fetcher.Stop()
+
+	hash := common.Hash{0x09}
+	for _, peer := range []string{"A", "B"} {
+		if err := fetcher.Notify(peer, []byte{types.LegacyTxType}, []uint32{111}, []common.Hash{hash}); err != nil {
+			t.Fatal(err)
+		}
+		<-wait
+		if err := fetcher.Promote(peer, []common.Hash{hash}); err != nil {
+			t.Fatal(err)
+		}
+		<-wait
+	}
+
+	got := make(map[string][]common.Hash, 2)
+	for range 2 {
+		select {
+		case req := <-requests:
+			got[req.peer] = req.hashes
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for fetch fanout requests")
+		}
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected requests to 2 peers, got %d", len(got))
+	}
+	for _, peer := range []string{"A", "B"} {
+		hashes := got[peer]
+		if len(hashes) != 1 || hashes[0] != hash {
+			t.Fatalf("unexpected request for peer %s: %v", peer, hashes)
+		}
+	}
+}
+
 // Tests that transaction announcements skip the waiting list if they are
 // already scheduled.
 func TestTransactionFetcherSkipWaiting(t *testing.T) {
@@ -2211,8 +2317,13 @@ func testTransactionFetcher(t *testing.T, tt txFetcherTest) {
 			}
 			for peer, hashes := range step.fetching {
 				for _, hash := range hashes {
-					if _, ok := fetcher.fetching[hash]; !ok {
+					fetching := fetcher.fetching[hash]
+					if fetching == nil {
 						t.Errorf("step %d, peer %s: hash %x missing from fetching", i, peer, hash)
+						continue
+					}
+					if _, ok := fetching[peer]; !ok {
+						t.Errorf("step %d, peer %s: hash %x missing peer in fetching set", i, peer, hash)
 					}
 				}
 			}

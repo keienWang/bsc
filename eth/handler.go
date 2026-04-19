@@ -392,6 +392,7 @@ func newHandler(config *handlerConfig) (*handler, error) {
 	}
 	addTxs := func(peer string, txs []*types.Transaction) []error {
 		errors := h.txpool.Add(txs, false)
+		logAcceptedTransactions("p2p:"+peer, txs, errors)
 		for _, err := range errors {
 			if err == txpool.ErrInBlackList {
 				accountBlacklistPeerCounter.Inc(1)
